@@ -1,5 +1,6 @@
 #!/usr/bin/env python3.9
 
+from multiprocessing import reduction
 import apsw
 import time
 import plistlib
@@ -8,18 +9,32 @@ import logging
 import subprocess
 import os.path
 import pathlib
-
+from datetime import datetime
 from watchdog.observers.kqueue import KqueueObserver
 from watchdog.events import FileSystemEventHandler
 
+def process(row):
+    data = {}
+    plist = plistlib.loads(row[3])
+    title = plist['$objects'][2]
+    message = plist['$objects'][3]
+    data['id'] = row[1]
+    data['message'] = message
+    data['title'] = title
+    date = row[1]
+    date_time = datetime.utcfromtimestamp(date + 978307200)
+    app = row[2]
+    data['app'] = app
+    data['date'] = date_time.strftime('%Y-%m-%d %H:%M:%S')
 
+    return data
 class DBEventHandler(FileSystemEventHandler):
     """Handles notification DB change events"""
 
-    def __init__(self, db, rec_ids, hook_script_path):
+    def __init__(self, db, note_ids, hook_script_path):
         super().__init__()
         self.db = db
-        self.rec_ids = rec_ids
+        self.note_ids = note_ids
         self.hook_script_path = hook_script_path
         self.logger = logging.root
 
@@ -38,14 +53,20 @@ class DBEventHandler(FileSystemEventHandler):
         cursor = self.db.cursor()
 
         # select notifications we don't know about
-        sql = f"SELECT rec_id, data FROM record WHERE rec_id NOT IN ({','.join('?' * len(rec_ids))})"
+        sql = 'SELECT date_presented, note_id, '\
+          '(SELECT bundleid from app_info WHERE app_info.app_id = '\
+          'presented_notifications.app_id) AS bundle, (SELECT encoded_data '\
+          'from notifications WHERE notifications.note_id = '\
+          'presented_notifications.note_id) AS data '\
+          f'from presented_notifications WHERE note_id NOT IN ({",".join("?" * len(self.note_ids))})'
 
         # query the db, and process it to a list of notif. IDs and data.
         # the db might be busy so just wait it out.
         while True:
             try:
-                new_objs = [(col[0], process_plist(col[1]))
-                            for col in cursor.execute(sql, rec_ids)]
+                new_objs = []
+                for row in cursor.execute(sql, self.note_ids):
+                    new_objs.append(process(row))
                 break
             except apsw.BusyError:
                 time.sleep(1)
@@ -54,43 +75,21 @@ class DBEventHandler(FileSystemEventHandler):
 
         for obj in new_objs:
             # add new IDs to known IDs
-            self.rec_ids.append(obj[0])
+            self.note_ids.append(obj['id'])
 
+            self.logger.info(obj)
             # run script for each new notification
             result = subprocess.run(
                 args=[
                     self.hook_script_path,
-                    obj[1]["app"],
-                    obj[1]["title"],
-                    obj[1]["body"],
-                    str(obj[1]["time"])
+                    obj["title"],
+                    obj["message"],
+                    obj["date"]
                 ],
                 capture_output=True
             )
-            self.logger.info(f"{obj[1]}")
             self.logger.info(f"stdout: {result.stdout}")
             self.logger.info(f"stderr: {result.stderr}")
-
-# process data plist from notification center db
-
-
-def process_plist(raw_plist):
-    notif_plist = plistlib.loads(raw_plist, fmt=plistlib.FMT_BINARY)
-
-    processed_notif_dict = {
-        "app": notif_plist["app"],
-        "title": "",
-        "body": notif_plist["req"]["body"],
-        # the time in the plist is in the Core Data format, convert it to a
-        # unix timestamp
-        "time": notif_plist["date"] + 978307200
-    }
-
-    # notifications may not have titles.
-    if "titl" in notif_plist["req"]:
-        processed_notif_dict["title"] = notif_plist["req"]["titl"]
-
-    return processed_notif_dict
 
 
 if __name__ == "__main__":
@@ -106,23 +105,25 @@ if __name__ == "__main__":
     db_folder = os.path.join(
         darwin_user_folder,
         "com.apple.notificationcenter",
-        "db2"
+        "db"
     )
 
     # we watch the write ahead log becuase that actually changes with the DB update
     # but we need to query the actual db file for the changes
     db_file = os.path.join(db_folder, "db")
     watch_file = os.path.join(db_folder, "db-wal")
+    # db_file = "db"
+    # watch_file = "db-wal"
 
     db = apsw.Connection(db_file)
-    rec_ids = []
+    note_ids = []
 
     # path to script the user wants to run on a notification being sent
     hook_script_path = os.path.join(
         pathlib.Path.home(), ".config", "nchook", "nchook_script"
     )
 
-    event_handler = DBEventHandler(db, rec_ids, hook_script_path)
+    event_handler = DBEventHandler(db, note_ids, hook_script_path)
 
     # we have to use a Kqueue observer not FSEvents because FSEvents
     # doesn't send updates for files the user doesn't own for privacy stuff,
